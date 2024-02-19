@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: A CloudFormation template to deploy the Stable Diffusion Web UI Forge by lllyasviel
+Parameters:
+  Ec2ImageId:
+    Type: String
+    Default: ami-08d56feea76b6f38b
+    Description: Enter appropriate AMI ID in your region. Tested with "Deep Learning AMI GPU PyTorch 1.13.1 (Ubuntu 20.04) 20230510" in us-east-1.
+  Ec2InstanceType:
+    Type: String
+    Default: g5.xlarge
+    AllowedValues:
+      - g4dn.xlarge
+      - g4dn.2xlarge
+      - g5.xlarge
+  SubnetAZ:
+    Type: String
+    Description: The Availability Zone in which to create the subnet
+    AllowedValues:
+      - us-east-1a
+      - us-east-1b
+      - us-east-1c
+      - us-east-1d
+      - us-east-1f
+    Default: us-east-1a
+  GradioUsername:
+    Type: String
+    Default: admin
+    Description: Username for SD Web UI authentication
+  GradioPassword:
+    Type: String
+    Default: password
+    Description: Password for SD Web UI authentication
+  AccessCidrIp:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR IP range that is allowed to access the instance. Default is 0.0.0.0/0 (allows all IPs).
+Resources:
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: MyVPC
+
+  MySubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Ref SubnetAZ
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: MySubnet
+
+
+  MyInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: MyInternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref MyInternetGateway
+
+  MyRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+      Tags:
+        - Key: Name
+          Value: MyRouteTable
+
+  MyRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref MyRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref MyInternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MySubnet
+      RouteTableId: !Ref MyRouteTable
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: sd-webui-sg
+      GroupDescription: Security group for SD WebUI EC2 instance
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AccessCidrIp
+        - IpProtocol: tcp
+          FromPort: 7860
+          ToPort: 7860
+          CidrIp: !Ref AccessCidrIp
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref Ec2InstanceType
+      ImageId: !Ref Ec2ImageId
+      SubnetId: !Ref MySubnet
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 300
+            VolumeType: gp3
+      "Tags" : [
+            {"Key" : "Name", "Value" : "sd-web-ui-cf"},
+        ]
+      SecurityGroupIds:
+        - Ref: SecurityGroup
+      UserData:
+        'Fn::Base64': !Sub |
+            Content-Type: multipart/mixed; boundary="//"
+            MIME-Version: 1.0
+
+            --//
+            Content-Type: text/cloud-config; charset="us-ascii"
+            MIME-Version: 1.0
+            Content-Transfer-Encoding: 7bit
+            Content-Disposition: attachment; filename="cloud-config.txt"
+
+            #cloud-config
+            cloud_final_modules:
+            - [scripts-user, always]
+
+            --//
+            Content-Type: text/x-shellscript; charset="us-ascii"
+            MIME-Version: 1.0
+            Content-Transfer-Encoding: 7bit
+            Content-Disposition: attachment; filename="userdata.txt"
+            
+            #!/bin/bash
+
+            # Disable unattended upgrades
+            sudo apt-get remove unattended-upgrades
+
+            # Install packages
+            sudo apt update
+            sudo add-apt-repository ppa:deadsnakes/ppa -y
+            sudo apt -y install wget git 
+            sudo apt -y install python3 python-is-python3 python3-pip python3-venv
+            sudo apt -y install python3.10 python3.10-distutils python3.10-venv python3.10-tk
+            curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
+            python3.10 -m pip install --upgrade pip
+            sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
+
+            # Launch Stable Diffusion Web UI
+            cd /home/ubuntu
+            # setup script uses existing folder if it exists. Feel free to change version here.
+            sudo -u ubuntu git clone https://github.com/lllyasviel/stable-diffusion-webui-forge.git
+
+            # Create systemd service
+            cat > /etc/systemd/system/sd-webui.service <<EOF
+            [Unit]
+            Description=SD WebUI Service
+            After=network.target
+
+            [Service]
+            User=ubuntu
+            WorkingDirectory=/home/ubuntu
+            ExecStart=/bin/bash -c 'stable-diffusion-webui-forge/webui.sh --xformers --listen --enable-insecure-extension-access --gradio-auth ${GradioUsername}:${GradioPassword} --gradio-queue &> sd-webui-log.txt'
+            Restart=always
+            RestartSec=3
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            # Enable and start the service
+            systemctl enable sd-webui
+            systemctl start sd-webui
+            --//
+  MyEIP:
+    Type: AWS::EC2::EIP
+  MyEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt MyEIP.AllocationId
+      InstanceId: !Ref EC2Instance
+Outputs:
+  PublicIp:
+    Description: EC2Instance Public IP
+    Value: !GetAtt EC2Instance.PublicIp
+  WebUIUrl:
+    Description: URL for the web UI
+    Value: !Sub 'http://${EC2Instance.PublicIp}:7860'
+  PublicDNS:
+    Description: EC2Instance Public DNS
+    Value: !GetAtt EC2Instance.PublicDnsName
+  InstanceID:
+    Description: EC2Instance ID
+    Value: !Ref EC2Instance
